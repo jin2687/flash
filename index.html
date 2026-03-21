@@ -359,9 +359,19 @@ function dbSave(en, ja) {
   return new Promise((res, rej) => {
     const tx = db.transaction(STORE, 'readwrite');
     const os = tx.objectStore(STORE);
-    const req = os.put({ en, ja, savedAt: Date.now() });
-    req.onsuccess = () => res(req.result);
-    req.onerror   = e => rej(e.target.error);
+    // Existing record lookup to keep its id (needed for unique-index put/update)
+    const idx = os.index('en');
+    const getReq = idx.get(en);
+    getReq.onsuccess = () => {
+      const existing = getReq.result;
+      const record = existing
+        ? { id: existing.id, en, ja, savedAt: Date.now() }
+        : { en, ja, savedAt: Date.now() };
+      const putReq = os.put(record);
+      putReq.onsuccess = () => res(putReq.result);
+      putReq.onerror   = e => rej(e.target.error);
+    };
+    getReq.onerror = e => rej(e.target.error);
   });
 }
 
@@ -419,6 +429,7 @@ let stream = null;
 
 async function startCamera() {
   try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia not supported');
     const constraints = {
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 960 } },
       audio: false
@@ -450,7 +461,7 @@ function captureFrame() {
 }
 
 snapBtn.addEventListener('click', () => {
-  if (!stream && !camError.style.display === 'none') return;
+  if (!stream) return;
   const dataUrl = captureFrame();
   previewImg.src = dataUrl;
   previewStrip.classList.add('show');
@@ -537,13 +548,13 @@ function extractWords(text) {
     'her','him','his','their','your','from','into','will','been','than',
     'then','when','what','which','who','how','any','one','two','new','old',
   ]);
-  const seen = new Set();
+  const seenLower = new Set();
   return raw
-    .map(w => w.toLowerCase())
     .filter(w => {
-      if (STOPWORDS.has(w)) return false;
-      if (seen.has(w)) return false;
-      seen.add(w);
+      const lower = w.toLowerCase();
+      if (STOPWORDS.has(lower)) return false;
+      if (seenLower.has(lower)) return false;
+      seenLower.add(lower);
       return true;
     })
     .slice(0, 30);
@@ -552,13 +563,14 @@ function extractWords(text) {
 // ── Translate & Save ────────────────────────────────────────
 async function translateAndSave(word, chipEl) {
   chipEl.classList.add('loading');
+  const wordLower = word.toLowerCase();
   try {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(word)}&langpair=en|ja`;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(wordLower)}&langpair=en|ja`;
     const res  = await fetch(url);
     const json = await res.json();
     const ja   = json?.responseData?.translatedText || '訳なし';
 
-    await dbSave(word, ja);
+    await dbSave(wordLower, ja);
     chipEl.classList.remove('loading');
     chipEl.classList.add('saved');
     chipEl.disabled = true;
