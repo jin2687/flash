@@ -487,66 +487,100 @@ function preprocessImage(dataUrl) {
   return new Promise(resolve => {
     const img = new Image();
     img.onload = () => {
-      const MIN_W = 1600;
+      // ① Upscale: Tesseract accuracy improves significantly above 1800px
+      const MIN_W = 1800;
       const scale = img.width < MIN_W ? MIN_W / img.width : 1;
+      const PAD   = 40; // white border helps Tesseract avoid edge clipping
       const w = Math.round(img.width  * scale);
       const h = Math.round(img.height * scale);
+      const cw = w + PAD * 2;
+      const ch = h + PAD * 2;
 
       const c = document.createElement('canvas');
-      c.width = w; c.height = h;
+      c.width = cw; c.height = ch;
       const ctx = c.getContext('2d');
 
-      // Slight sharpening via shadow trick then draw
-      ctx.filter = 'contrast(1.4) brightness(1.05)';
-      ctx.drawImage(img, 0, 0, w, h);
-      ctx.filter = 'none';
+      // Fill with white (padding)
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.drawImage(img, PAD, PAD, w, h);
 
-      const imgData = ctx.getImageData(0, 0, w, h);
+      const imgData = ctx.getImageData(0, 0, cw, ch);
       const d = imgData.data;
+      const N = cw * ch;
 
-      // Convert to grayscale and collect luminance values
-      const gray = new Uint8Array(w * h);
-      for (let i = 0; i < w * h; i++) {
-        const r = d[i*4], g = d[i*4+1], b = d[i*4+2];
-        gray[i] = Math.round(0.299*r + 0.587*g + 0.114*b);
+      // ② Grayscale
+      const gray = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        gray[i] = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
       }
 
-      // Contrast stretch: map [min,max] → [0,255]
-      let lo = 255, hi = 0;
-      for (let i = 0; i < gray.length; i++) {
-        if (gray[i] < lo) lo = gray[i];
-        if (gray[i] > hi) hi = gray[i];
+      // ③ Unsharp mask (amount=1.5, radius≈1px kernel)
+      //    sharpened = original + amount * (original - blurred)
+      const blurred = new Float32Array(N);
+      // Simple box blur 3x3
+      for (let y = 0; y < ch; y++) {
+        for (let x = 0; x < cw; x++) {
+          let sum = 0, cnt = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = x+dx, ny = y+dy;
+              if (nx >= 0 && nx < cw && ny >= 0 && ny < ch) {
+                sum += gray[ny * cw + nx]; cnt++;
+              }
+            }
+          }
+          blurred[y * cw + x] = sum / cnt;
+        }
       }
+      const SHARP_AMT = 1.8;
+      for (let i = 0; i < N; i++) {
+        gray[i] = Math.min(255, Math.max(0, gray[i] + SHARP_AMT * (gray[i] - blurred[i])));
+      }
+
+      // ④ Contrast stretch (clamp 5th–95th percentile → 0–255)
+      const sorted = Float32Array.from(gray).sort();
+      const lo = sorted[Math.floor(N * 0.05)];
+      const hi = sorted[Math.floor(N * 0.95)];
       const range = hi - lo || 1;
-      for (let i = 0; i < gray.length; i++) {
-        gray[i] = Math.round((gray[i] - lo) / range * 255);
+      for (let i = 0; i < N; i++) {
+        gray[i] = Math.min(255, Math.max(0, (gray[i] - lo) / range * 255));
       }
 
-      // Otsu threshold for binarization
+      // ⑤ Otsu threshold
       const hist = new Int32Array(256);
-      for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
-      const total = gray.length;
+      for (let i = 0; i < N; i++) hist[Math.round(gray[i])]++;
       let sumAll = 0;
       for (let t = 0; t < 256; t++) sumAll += t * hist[t];
       let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
       for (let t = 0; t < 256; t++) {
         wB += hist[t];
         if (!wB) continue;
-        const wF = total - wB;
+        const wF = N - wB;
         if (!wF) break;
         sumB += t * hist[t];
-        const mB = sumB / wB;
-        const mF = (sumAll - sumB) / wF;
-        const v = wB * wF * (mB - mF) * (mB - mF);
+        const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+        const v = wB * wF * (mB - mF) ** 2;
         if (v > maxVar) { maxVar = v; threshold = t; }
       }
 
-      // Write binarized pixels back (white bg, black text)
-      for (let i = 0; i < w * h; i++) {
+      // ⑥ Binarize: bright pixel → white (255), dark → black (0)
+      let blackCount = 0;
+      for (let i = 0; i < N; i++) {
         const v = gray[i] > threshold ? 255 : 0;
+        if (v === 0) blackCount++;
         d[i*4] = d[i*4+1] = d[i*4+2] = v;
         d[i*4+3] = 255;
       }
+
+      // ⑦ Auto-invert: if >55% pixels are black → image was dark-bg/light-text → invert
+      //    Tesseract needs dark text on light background
+      if (blackCount / N > 0.55) {
+        for (let i = 0; i < N; i++) {
+          d[i*4] = d[i*4+1] = d[i*4+2] = 255 - d[i*4];
+        }
+      }
+
       ctx.putImageData(imgData, 0, 0);
       resolve(c.toDataURL('image/png'));
     };
@@ -572,6 +606,14 @@ async function runOCR(dataUrl) {
     // Preprocess before OCR
     const processedUrl = await preprocessImage(dataUrl);
 
+    // Run 3 passes with different PSMs, then merge unique words
+    // PSM 3=AUTO, PSM 6=single block, PSM 11=sparse – covers most real-world layouts
+    const PSM_MODES = [
+      { mode: Tesseract.PSM.AUTO,        label: '解析中 (AUTO)...'   },
+      { mode: Tesseract.PSM.SINGLE_BLOCK, label: '解析中 (BLOCK)...' },
+      { mode: Tesseract.PSM.SPARSE_TEXT, label: '解析中 (SPARSE)...' },
+    ];
+
     const worker = await Tesseract.createWorker('eng', 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
@@ -582,17 +624,20 @@ async function runOCR(dataUrl) {
       }
     });
 
-    // PSM 11 = sparse text (finds words anywhere, ideal for real-world photos)
-    // Whitelist only ASCII letters to eliminate OCR noise characters
     await worker.setParameters({
-      tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ',
     });
 
-    const { data: { text } } = await worker.recognize(processedUrl);
+    let combinedText = '';
+    for (const { mode, label } of PSM_MODES) {
+      loadingMsg.textContent = label;
+      await worker.setParameters({ tessedit_pageseg_mode: mode });
+      const { data: { text } } = await worker.recognize(processedUrl);
+      combinedText += ' ' + text;
+    }
     await worker.terminate();
 
-    const words = extractWords(text);
+    const words = extractWords(combinedText);
     loadingUI.classList.remove('show');
 
     if (words.length === 0) {
