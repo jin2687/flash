@@ -538,47 +538,23 @@ function preprocessImage(dataUrl) {
         gray[i] = Math.min(255, Math.max(0, gray[i] + SHARP_AMT * (gray[i] - blurred[i])));
       }
 
-      // ④ Contrast stretch (clamp 5th–95th percentile → 0–255)
+      // ④ Contrast stretch (clamp 2nd–98th percentile → 0–255)
       const sorted = Float32Array.from(gray).sort();
-      const lo = sorted[Math.floor(N * 0.05)];
-      const hi = sorted[Math.floor(N * 0.95)];
+      const lo = sorted[Math.floor(N * 0.02)];
+      const hi = sorted[Math.floor(N * 0.98)];
       const range = hi - lo || 1;
       for (let i = 0; i < N; i++) {
         gray[i] = Math.min(255, Math.max(0, (gray[i] - lo) / range * 255));
       }
 
-      // ⑤ Otsu threshold
-      const hist = new Int32Array(256);
-      for (let i = 0; i < N; i++) hist[Math.round(gray[i])]++;
-      let sumAll = 0;
-      for (let t = 0; t < 256; t++) sumAll += t * hist[t];
-      let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
-      for (let t = 0; t < 256; t++) {
-        wB += hist[t];
-        if (!wB) continue;
-        const wF = N - wB;
-        if (!wF) break;
-        sumB += t * hist[t];
-        const mB = sumB / wB, mF = (sumAll - sumB) / wF;
-        const v = wB * wF * (mB - mF) ** 2;
-        if (v > maxVar) { maxVar = v; threshold = t; }
-      }
-
-      // ⑥ Binarize: bright pixel → white (255), dark → black (0)
-      let blackCount = 0;
+      // ⑤ Write grayscale back — NO manual binarization.
+      //    Tesseract applies its own per-region adaptive threshold internally (Leptonica),
+      //    which handles mixed backgrounds (dark scene + bright UI bubbles) far better
+      //    than a single global Otsu threshold.
       for (let i = 0; i < N; i++) {
-        const v = gray[i] > threshold ? 255 : 0;
-        if (v === 0) blackCount++;
+        const v = Math.round(gray[i]);
         d[i*4] = d[i*4+1] = d[i*4+2] = v;
         d[i*4+3] = 255;
-      }
-
-      // ⑦ Auto-invert: if >55% pixels are black → image was dark-bg/light-text → invert
-      //    Tesseract needs dark text on light background
-      if (blackCount / N > 0.55) {
-        for (let i = 0; i < N; i++) {
-          d[i*4] = d[i*4+1] = d[i*4+2] = 255 - d[i*4];
-        }
       }
 
       ctx.putImageData(imgData, 0, 0);
