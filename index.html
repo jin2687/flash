@@ -515,10 +515,28 @@ function preprocessImage(dataUrl) {
         gray[i] = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
       }
 
-      // ③ Unsharp mask (amount=1.5, radius≈1px kernel)
-      //    sharpened = original + amount * (original - blurred)
+      // ③ Descreen: 5×5 Gaussian blur removes screen-pixel moiré from photos of displays
+      //    kernel = [1,4,7,4,1; 4,16,26,16,4; 7,26,41,26,7; ...] / 273
+      const GK = [1,4,7,4,1, 4,16,26,16,4, 7,26,41,26,7, 4,16,26,16,4, 1,4,7,4,1];
+      const descreened = new Float32Array(N);
+      for (let y = 0; y < ch; y++) {
+        for (let x = 0; x < cw; x++) {
+          let sum = 0, wsum = 0;
+          for (let dy = -2; dy <= 2; dy++) {
+            for (let dx = -2; dx <= 2; dx++) {
+              const nx = x+dx, ny = y+dy;
+              if (nx >= 0 && nx < cw && ny >= 0 && ny < ch) {
+                const w = GK[(dy+2)*5+(dx+2)];
+                sum += gray[ny * cw + nx] * w; wsum += w;
+              }
+            }
+          }
+          descreened[y * cw + x] = sum / wsum;
+        }
+      }
+
+      // ④ Unsharp mask on descreened image (3×3 box blur for local contrast)
       const blurred = new Float32Array(N);
-      // Simple box blur 3x3
       for (let y = 0; y < ch; y++) {
         for (let x = 0; x < cw; x++) {
           let sum = 0, cnt = 0;
@@ -526,16 +544,16 @@ function preprocessImage(dataUrl) {
             for (let dx = -1; dx <= 1; dx++) {
               const nx = x+dx, ny = y+dy;
               if (nx >= 0 && nx < cw && ny >= 0 && ny < ch) {
-                sum += gray[ny * cw + nx]; cnt++;
+                sum += descreened[ny * cw + nx]; cnt++;
               }
             }
           }
           blurred[y * cw + x] = sum / cnt;
         }
       }
-      const SHARP_AMT = 1.8;
+      const SHARP_AMT = 2.0;
       for (let i = 0; i < N; i++) {
-        gray[i] = Math.min(255, Math.max(0, gray[i] + SHARP_AMT * (gray[i] - blurred[i])));
+        gray[i] = Math.min(255, Math.max(0, descreened[i] + SHARP_AMT * (descreened[i] - blurred[i])));
       }
 
       // ④ Contrast stretch (clamp 2nd–98th percentile → 0–255)
@@ -582,12 +600,30 @@ async function runOCR(dataUrl) {
     // Preprocess before OCR
     const processedUrl = await preprocessImage(dataUrl);
 
-    // Run 3 passes with different PSMs, then merge unique words
-    // PSM 3=AUTO, PSM 6=single block, PSM 11=sparse – covers most real-world layouts
-    const PSM_MODES = [
-      { mode: Tesseract.PSM.AUTO,        label: '解析中 (AUTO)...'   },
-      { mode: Tesseract.PSM.SINGLE_BLOCK, label: '解析中 (BLOCK)...' },
-      { mode: Tesseract.PSM.SPARSE_TEXT, label: '解析中 (SPARSE)...' },
+    // Also create an inverted version: handles light text on dark background
+    // (e.g. game UI text on dark scenes, white subtitles, etc.)
+    const invertedUrl = await (async () => {
+      const img = new Image();
+      await new Promise(r => { img.onload = r; img.src = processedUrl; });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const id = ctx.getImageData(0, 0, c.width, c.height);
+      const d = id.data;
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = 255 - d[i]; d[i+1] = 255 - d[i+1]; d[i+2] = 255 - d[i+2];
+      }
+      ctx.putImageData(id, 0, 0);
+      return c.toDataURL('image/png');
+    })();
+
+    // 4 passes: normal×3 PSMs + inverted sparse
+    const PSM_PASSES = [
+      { url: processedUrl, mode: Tesseract.PSM.AUTO,         label: '解析中 (1/4)...' },
+      { url: processedUrl, mode: Tesseract.PSM.SINGLE_BLOCK, label: '解析中 (2/4)...' },
+      { url: processedUrl, mode: Tesseract.PSM.SPARSE_TEXT,  label: '解析中 (3/4)...' },
+      { url: invertedUrl,  mode: Tesseract.PSM.SPARSE_TEXT,  label: '解析中 (4/4)...' },
     ];
 
     const worker = await Tesseract.createWorker('eng', 1, {
@@ -605,10 +641,10 @@ async function runOCR(dataUrl) {
     });
 
     let combinedText = '';
-    for (const { mode, label } of PSM_MODES) {
+    for (const { url, mode, label } of PSM_PASSES) {
       loadingMsg.textContent = label;
       await worker.setParameters({ tessedit_pageseg_mode: mode });
-      const { data: { text } } = await worker.recognize(processedUrl);
+      const { data: { text } } = await worker.recognize(url);
       combinedText += ' ' + text;
     }
     await worker.terminate();
