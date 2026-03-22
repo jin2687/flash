@@ -475,6 +475,85 @@ retakeBtn.addEventListener('click', () => {
   document.getElementById('word-list').innerHTML = '';
 });
 
+// ── Image Preprocessing ────────────────────────────────────
+/**
+ * Preprocess image for better OCR accuracy:
+ * 1. Upscale to at least 1600px wide (Tesseract prefers larger images)
+ * 2. Grayscale
+ * 3. Contrast stretch (normalize min/max to 0-255)
+ * 4. Adaptive threshold (Otsu-like: pixels above mean → white, below → black)
+ */
+function preprocessImage(dataUrl) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const MIN_W = 1600;
+      const scale = img.width < MIN_W ? MIN_W / img.width : 1;
+      const w = Math.round(img.width  * scale);
+      const h = Math.round(img.height * scale);
+
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+
+      // Slight sharpening via shadow trick then draw
+      ctx.filter = 'contrast(1.4) brightness(1.05)';
+      ctx.drawImage(img, 0, 0, w, h);
+      ctx.filter = 'none';
+
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const d = imgData.data;
+
+      // Convert to grayscale and collect luminance values
+      const gray = new Uint8Array(w * h);
+      for (let i = 0; i < w * h; i++) {
+        const r = d[i*4], g = d[i*4+1], b = d[i*4+2];
+        gray[i] = Math.round(0.299*r + 0.587*g + 0.114*b);
+      }
+
+      // Contrast stretch: map [min,max] → [0,255]
+      let lo = 255, hi = 0;
+      for (let i = 0; i < gray.length; i++) {
+        if (gray[i] < lo) lo = gray[i];
+        if (gray[i] > hi) hi = gray[i];
+      }
+      const range = hi - lo || 1;
+      for (let i = 0; i < gray.length; i++) {
+        gray[i] = Math.round((gray[i] - lo) / range * 255);
+      }
+
+      // Otsu threshold for binarization
+      const hist = new Int32Array(256);
+      for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+      const total = gray.length;
+      let sumAll = 0;
+      for (let t = 0; t < 256; t++) sumAll += t * hist[t];
+      let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+      for (let t = 0; t < 256; t++) {
+        wB += hist[t];
+        if (!wB) continue;
+        const wF = total - wB;
+        if (!wF) break;
+        sumB += t * hist[t];
+        const mB = sumB / wB;
+        const mF = (sumAll - sumB) / wF;
+        const v = wB * wF * (mB - mF) * (mB - mF);
+        if (v > maxVar) { maxVar = v; threshold = t; }
+      }
+
+      // Write binarized pixels back (white bg, black text)
+      for (let i = 0; i < w * h; i++) {
+        const v = gray[i] > threshold ? 255 : 0;
+        d[i*4] = d[i*4+1] = d[i*4+2] = v;
+        d[i*4+3] = 255;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      resolve(c.toDataURL('image/png'));
+    };
+    img.src = dataUrl;
+  });
+}
+
 // ── OCR ────────────────────────────────────────────────────
 const loadingUI  = document.getElementById('loading-ui');
 const loadingMsg = document.getElementById('loading-msg');
@@ -486,10 +565,13 @@ async function runOCR(dataUrl) {
   loadingUI.classList.add('show');
   wordResult.style.display = 'none';
   wordList.innerHTML = '';
-  loadingMsg.textContent = '読み取り中...';
+  loadingMsg.textContent = '画像処理中...';
   ocrProgress.textContent = '';
 
   try {
+    // Preprocess before OCR
+    const processedUrl = await preprocessImage(dataUrl);
+
     const worker = await Tesseract.createWorker('eng', 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
@@ -500,7 +582,14 @@ async function runOCR(dataUrl) {
       }
     });
 
-    const { data: { text } } = await worker.recognize(dataUrl);
+    // PSM 11 = sparse text (finds words anywhere, ideal for real-world photos)
+    // Whitelist only ASCII letters to eliminate OCR noise characters
+    await worker.setParameters({
+      tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ',
+    });
+
+    const { data: { text } } = await worker.recognize(processedUrl);
     await worker.terminate();
 
     const words = extractWords(text);
